@@ -9,6 +9,8 @@
 </div>
 
 ---
+## Demo
+<video src="./demo.mov"></video>
 
 ## Overview
 

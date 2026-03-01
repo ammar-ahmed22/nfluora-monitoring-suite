@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import pandas as pd
 import sys
 
 if __name__ == "__main__":
@@ -8,17 +9,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     filename = sys.argv[1]
-    print(f"Loading data from {filename}...")
-    times = []
-    smoothed_values = []
-    with open(filename, "r") as f:
-        lines = f.readlines()
-        for line in lines:
-            time, raw, corrected, smoothed = line.strip().split(",")
-            times.append(float(time))
-            smoothed_values.append(float(smoothed))
+    df = pd.read_csv(filename)
 
-    plt.plot(times, smoothed_values, linewidth=2)
+    plt.plot(df["timestamp"], df['smoothed'])
     plt.xlabel("Time (s)")
     plt.ylabel("Voltage (V)")
     plt.title("Recorded Smoothed Signal Over Time")

@@ -78,6 +78,7 @@ def handle_record(duration: str, filename: str):
         return
     dur = tl.seconds
     recorder.start(dur, filename);
+    recorder.record("timestamp,raw,corrected,smoothed\n") # Write CSV header
     pass
 
 def handle_exit():
