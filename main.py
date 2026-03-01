@@ -1,33 +1,15 @@
-from typing import List
+from datetime import time
+from typing import List, Deque
 import serial
-# import sys
-# import select
-from enum import Enum, auto
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 from collections import deque
-from stats import RunningAverage, median
 from config import Config, require_env
+from calibration import Calibrator, CalibrationState
 import cli
-# from cli import read_command, print_welcome_message
-
-
-class CalibrationState(Enum):
-    IDLE = auto()        # Waiting for user to trigger calibration
-    CALIBRATING = auto() # Collecting baseline samples
-    READY = auto()       # Baseline acquired, normal operation
-
-
-# --- Non-blocking input ---
-# input_buffer = ""
-
-# def check_for_command():
-#     """Check stdin for input commands without blocking. Returns command if complete, None otherwise."""
-#     # Check if stdin has data available (non-blocking)
-#     while select.select([sys.stdin], [], [], 0)[0]:
-#         line = sys.stdin.readline()
-#         if line:
-#             return line.strip().lower()
-#     return None
+from timelength import TimeLength
+import time
+from recorder import Recorder
 
 
 # --- Config ---
@@ -35,22 +17,29 @@ PORT = require_env('PORT')
 BAUDRATE = int(require_env('BAUDRATE'))
 config = Config(port=PORT, baudrate=BAUDRATE)
 
-
 # --- Serial ---
 ser = serial.Serial(config.port, config.baudrate)
 
-# baseline collection buffer
-baseline_buf = []
+# --- Calibration ---
+calibrator = Calibrator(config)
 
-# plotting buffers
-raw_window = deque([0.0] * config.plot_window, maxlen=config.plot_window)
-corr_window = deque([0.0] * config.plot_window, maxlen=config.plot_window)
-smooth_window = deque([0.0] * config.plot_window, maxlen=config.plot_window)
+# --- Plotting buffers ---
+@dataclass
+class Data:
+    raw: Deque[float]
+    corrected: Deque[float]
+    smoothed: Deque[float]
+    samples: int = 0
 
-baseline: float | None = None
-running_avg = RunningAverage(config.moving_avg_k)
-sample_count = 0
-state = CalibrationState.IDLE
+    @staticmethod
+    def create(window_size: int) -> "Data":
+        return Data(
+            raw=deque([0.0] * window_size, maxlen=window_size),
+            corrected=deque([0.0] * window_size, maxlen=window_size),
+            smoothed=deque([0.0] * window_size, maxlen=window_size),
+        )
+
+data = Data.create(config.plot_window)
 
 plt.ion()
 fig, ax = plt.subplots()
@@ -60,9 +49,10 @@ if fig_manager is not None:
         fig_manager.full_screen_toggle()
     fig_manager.set_window_title("nFluora NIR Fluorescence Sensor Visualization")
 
-raw_line, = ax.plot(raw_window, alpha=0.25, label="raw")
-corr_line, = ax.plot(corr_window, alpha=0.25, label="baseline corrected")
-smooth_line, = ax.plot(smooth_window, linewidth=2, label=f"smoothed ({config.moving_avg_k} sample moving avg)")
+raw_line, = ax.plot(data.raw, alpha=0.25, label="raw")
+corr_line, = ax.plot(data.corrected, alpha=0.25, label="baseline corrected")
+smooth_line, = ax.plot(data.smoothed, linewidth=2, label=f"smoothed")
+smooth_line.set_visible(False)  # Hidden until calibration is READY
 
 ax.legend(loc='upper right')
 ax.set_xlabel("sample")
@@ -70,51 +60,25 @@ ax.set_ylabel("Voltage (raw / corrected)")
 title = ax.set_title("IDLE - Type 'baseline' to start calibration")
 
 
-def process_value(value):
-    """Process a single value from serial. Returns True if state changed."""
-    global baseline, state
-    raw_window.append(value)
-
-    if state == CalibrationState.IDLE:
-        # Just show raw data, no correction
-        corr_window.append(0)
-        smooth_window.append(0)
-        return False
-
-    elif state == CalibrationState.CALIBRATING:
-        # Collect baseline samples
-        baseline_buf.append(value)
-        if len(baseline_buf) >= config.baseline_samples:
-            if config.use_median_baseline:
-                baseline = median(baseline_buf)
-            else:
-                baseline = sum(baseline_buf) / len(baseline_buf)
-            print(f"Baseline acquired: {baseline:.2f}")
-            state = CalibrationState.READY
-            return True
-        corr_window.append(0)
-        smooth_window.append(0)
-        return False
-
-    else:  # CalibrationState.READY
-        corrected = value - baseline
-        corr_window.append(corrected)
-        running_avg.add(corrected)
-        smooth_window.append(running_avg.get())
-        return False
-
-def adc2volts(adc_value, vref=5.0, resolution=1024):
+def adc2volts(adc_value: float, vref: float = 5.0, resolution: int = 1024) -> float:
     """Convert ADC counts to voltage."""
     return (adc_value / (resolution - 1)) * vref
 
-def start_calibration():
-    """Reset state for a new calibration."""
-    global state, baseline
-    baseline_buf.clear()
-    running_avg.reset()
-    baseline = None
-    state = CalibrationState.CALIBRATING
-    print("Starting baseline calibration...")
+
+recorder = Recorder()
+
+def handle_record(duration: str, filename: str):
+    global recorder
+    tl = TimeLength(duration).result
+    if not tl.success:
+        print(f"Invalid duration format: {duration}")
+        return
+    if not calibrator.state == CalibrationState.READY:
+        print("Calibration not ready. Please calibrate before recording.")
+        return
+    dur = tl.seconds
+    recorder.start(dur, filename);
+    pass
 
 def handle_exit():
     print("\nByebye!")
@@ -128,20 +92,19 @@ def handle_command(cmd: cli.CommandType, args: List[str]) -> None:
         case cli.CommandType.HELP:
             cli.help_message()
         case cli.CommandType.CALIBRATE:
-            start_calibration()
+            calibrator.start()
         case cli.CommandType.EXIT:
             handle_exit()
         case cli.CommandType.RECORD:
-            print(f"record data for {args[0]} to file {args[1]} (not implemented yet)")
-        case _:
-            print(f"Unhandled command: {cmd}")
+            duration, filename = args
+            handle_record(duration, filename)
 
 
 cli.welcome_message()
 command_handler = cli.CommandHandler(handle_command)
 try:
     while True:
-        # Check for calibration trigger (non-blocking)
+        # Check for stdin (non-blocking)
         input = cli.read_input()
         if input :
             cmd, args = input
@@ -154,32 +117,44 @@ try:
             if lines_read == 0 or ser.in_waiting:
                 try:
                     value = adc2volts(float(ser.readline().decode(errors="ignore").strip()))
-                    state_changed = process_value(value)
-                    sample_count += 1
+                    data.raw.append(value)
+                    corrected, smoothed, state_changed = calibrator.process(value)
+                    data.corrected.append(corrected)
+                    data.smoothed.append(smoothed)
+                    now = time.time()
+                    if recorder.is_recording():
+                        print(f"Recording... {recorder.remaining():.1f}s remaining", end="\r")
+                        recorder.record(f"{round(recorder.elapsed(), 3)},{value},{corrected},{smoothed}\n")
+                    else:
+                        recorder.stop()  # Ensure recording is stopped if time has elapsed
+                    data.samples += 1
                     lines_read += 1
 
                     # Update title based on state
-                    if state == CalibrationState.IDLE:
+                    if calibrator.state == CalibrationState.IDLE:
                         title.set_text("IDLE - Type 'calibrate' to start calibration")
-                    elif state == CalibrationState.CALIBRATING:
-                        title.set_text(f"CALIBRATING BASELINE (DO NOT APPLY SIGNAL) ({len(baseline_buf)}/{config.baseline_samples})")
+                    elif calibrator.state == CalibrationState.CALIBRATING:
+                        current, total = calibrator.calibration_progress
+                        title.set_text(f"CALIBRATING BASELINE (DO NOT APPLY SIGNAL) ({current}/{total})")
                     elif state_changed:
                         title.set_text("READY")
+                        smooth_line.set_visible(True)
+                        ax.legend(loc='upper right')  # Recreate legend to show smooth_line color
                 except ValueError:
                     continue
             else:
                 break
 
         # Only update plot every N samples
-        if sample_count % config.plot_update_interval == 0:
-            x = range(len(raw_window))
+        if data.samples % config.plot_update_interval == 0:
+            x = range(len(data.raw))
             raw_line.set_xdata(x)
             corr_line.set_xdata(x)
             smooth_line.set_xdata(x)
 
-            raw_line.set_ydata(raw_window)
-            corr_line.set_ydata(corr_window)
-            smooth_line.set_ydata(smooth_window)
+            raw_line.set_ydata(data.raw)
+            corr_line.set_ydata(data.corrected)
+            smooth_line.set_ydata(data.smoothed)
 
             ax.relim()
             ax.autoscale_view()
